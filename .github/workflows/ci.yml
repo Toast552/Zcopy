@@ -261,19 +261,6 @@ jobs:
     - name: Populate cache
       uses: ./.github/actions/cache
 
-    # Ensure that Cargo resolves the minimum possible syn version so that if we
-    # accidentally make a change which depends upon features added in more
-    # recent versions of syn, we'll catch it in CI.
-    #
-    # TODO(#1595): Debug why this step is still necessary after #1564 and maybe
-    # remove it.
-    - name: Pin syn dependency
-      run: |
-        set -eo pipefail
-        # Override the exising `syn` dependency with one which requires an exact
-        # version.
-        cargo add -p zerocopy-derive 'syn@=2.0.46'
-
     - name: Configure environment variables
       env:
         TOOLCHAIN: ${{ matrix.toolchain }}
@@ -334,11 +321,6 @@ jobs:
           #
           # [1] https://github.com/actions/runner/issues/409#issuecomment-752775072
           components: clippy, rust-src ${{ matrix.toolchain == 'nightly' && ', miri' || '' }}
-
-    - name: Rust Cache
-      uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-      with:
-        key: "${{ matrix.target }}"
 
     # On the `thumbv6m-none-eabi` target, we can't run `cargo check --tests` due
     # to the `memchr` crate, so we just do `cargo check` instead.
@@ -460,6 +442,15 @@ jobs:
       run: |
         set -eo pipefail
 
+        # FIXME(#2906): We do this because `cargo vendor` doesn't currently
+        # support vendoring std's dependencies (required in order to build std
+        # from source, which Miri does). As a workaround, we simply temporarily
+        # remove the cargo config and bypass vendoring altogether. Eventually,
+        # we should get vendoring working for std's dependencies too.
+        #
+        # See also: https://github.com/rust-lang/wg-cargo-std-aware/issues/23
+        mv .cargo/config.toml .cargo/config.toml.bak
+
         # Work around https://github.com/rust-lang/miri/issues/3125
         [ "$TARGET" == "aarch64-unknown-linux-gnu" ] && cargo clean
 
@@ -467,7 +458,13 @@ jobs:
         THREADS=$(echo "$(nproc) * 2" | bc)
         echo "Running Miri tests with $THREADS threads" | tee -a $GITHUB_STEP_SUMMARY
 
-        cargo install cargo-nextest
+        # FIXME(https://github.com/nextest-rs/nextest/issues/2990): Once the fix
+        # [1] for this `cargo miri nextest` bug is published, either go back to
+        # installing the latest version of `cargo-nextest` or pin and set up a
+        # roller.
+        #
+        # [1] https://github.com/nextest-rs/nextest/pull/2991
+        cargo install --locked --version 0.9.122 cargo-nextest
 
         # Run under both the stacked borrows model (default) and under the tree 
         # borrows model to ensure we're compliant with both.
@@ -479,6 +476,8 @@ jobs:
             --target $TARGET \
             $FEATURES
         done
+
+        mv .cargo/config.toml.bak .cargo/config.toml
       # Only nightly has a working Miri, so we skip installing on all other
       # toolchains.
       #
@@ -567,6 +566,18 @@ jobs:
           echo "ZC_SKIP_CARGO_SEMVER_CHECKS=1" >> $GITHUB_ENV
         fi
 
+    # FIXME(#2906): We do this because `cargo semver-checks` fetches the latest
+    # zerocopy from crates.io, but `.cargo/config.toml` causes that to resolve
+    # in our vendor directory, and we don't vendor zerocopy. Removing this file
+    # has the effect of causing the subsequent build to use crates.io rather
+    # than vendored dependencies, which is fine since we only run this on the
+    # stable toolchain. Eventually, we should update this job to use the
+    # `--baseline-rev` option to use a previous git commit as the baseline for
+    # checking compatibility (rather than the most recent published version),
+    # which will make this unnecessary.
+    - name: Remove Cargo config
+      run: rm .cargo/config.toml
+
     # Check semver compatibility with the most recently-published version on
     # crates.io. We do this in the matrix rather than in its own job so that it
     # gets run on different targets. Some of our API is target-specific (e.g.,
@@ -611,7 +622,7 @@ jobs:
       - name: Generate code coverage
         run: |
           set -eo pipefail
-          ./cargo.sh +nightly install cargo-llvm-cov
+          ./cargo.sh +nightly install --version 0.8.0 cargo-llvm-cov
           ./cargo.sh +nightly llvm-cov \
             --package zerocopy \
             --target x86_64-unknown-linux-gnu \
@@ -660,10 +671,13 @@ jobs:
   check_be_aarch64:
     runs-on: ubuntu-latest
     name: Build (zerocopy / nightly / --simd / aarch64_be-unknown-linux-gnu)
+    needs: generate_cache
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
+      - name: Populate cache
+        uses: ./.github/actions/cache
       - name: Configure environment variables
         run: |
           set -eo pipefail
@@ -671,10 +685,6 @@ jobs:
           RUSTFLAGS="$RUSTFLAGS $ZC_NIGHTLY_RUSTFLAGS"
           echo "RUSTFLAGS=$RUSTFLAGS" >> $GITHUB_ENV
           echo "ZC_TOOLCHAIN=$ZC_TOOLCHAIN" >> $GITHUB_ENV
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          key: aarch64_be-unknown-linux-gnu
       - name: Install stable Rust for use in 'cargo.sh'
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -685,17 +695,32 @@ jobs:
             toolchain: ${{ env.ZC_TOOLCHAIN }}
             components: clippy, rust-src
       - name: Check big endian for aarch64_be-unknown-linux-gnu target
-        run: ./cargo.sh +nightly build --target=aarch64_be-unknown-linux-gnu -Zbuild-std --features simd
+        run: |
+          set -eo pipefail
+
+          # FIXME(#2906): We do this because `cargo vendor` doesn't currently
+          # support vendoring std's dependencies (required in order to build
+          # std from source, as we do here). As a workaround, we simply nuke
+          # the cargo config and bypass vendoring altogether. Eventually, we
+          # should get vendoring working for std's dependencies too.
+          #
+          # See also: https://github.com/rust-lang/wg-cargo-std-aware/issues/23
+          rm .cargo/config.toml
+
+          ./cargo.sh +nightly build --target=aarch64_be-unknown-linux-gnu -Zbuild-std --features simd
 
   # We can't use this as part of the build matrix because rustup doesn't support
   # the `avr-none` target.
   check_avr_atmega:
     runs-on: ubuntu-latest
     name: Build (zerocopy / nightly / --simd / avr-none)
+    needs: generate_cache
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
+      - name: Populate cache
+        uses: ./.github/actions/cache
       - name: Configure environment variables
         run: |
           set -eo pipefail
@@ -703,10 +728,6 @@ jobs:
           RUSTFLAGS="$RUSTFLAGS $ZC_NIGHTLY_RUSTFLAGS"
           echo "RUSTFLAGS=$RUSTFLAGS" >> $GITHUB_ENV
           echo "ZC_TOOLCHAIN=$ZC_TOOLCHAIN" >> $GITHUB_ENV
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
-        with:
-          key: avr-none
       - name: Install stable Rust for use in 'cargo.sh'
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -716,6 +737,15 @@ jobs:
         with:
             toolchain: ${{ env.ZC_TOOLCHAIN }}
             components: clippy, rust-src
+      # FIXME(#2906): We do this because `cargo vendor` doesn't currently
+      # support vendoring std's dependencies (required in order to build std
+      # from source, as we do here). As a workaround, we simply nuke the cargo
+      # config and bypass vendoring altogether. Eventually, we should get
+      # vendoring working for std's dependencies too.
+      #
+      # See also: https://github.com/rust-lang/wg-cargo-std-aware/issues/23
+      - name: Remove Cargo config
+        run: rm .cargo/config.toml
       # NOTE: We cannot check tests because of a number of different issues (at
       # the time of writing):
       # - No `alloc::sync`
@@ -731,10 +761,13 @@ jobs:
   check_fmt:
     runs-on: ubuntu-latest
     name: Check Rust formatting
+    needs: generate_cache
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
+      - name: Populate cache
+        uses: ./.github/actions/cache
       - name: Check Rust formatting
         run: |
           set -eo pipefail
@@ -744,6 +777,19 @@ jobs:
 
           ./ci/check_fmt.sh
 
+  check_stale_stderr:
+    runs-on: ubuntu-latest
+    name: Check stale stderr files
+    needs: generate_cache
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+      - name: Populate cache
+        uses: ./.github/actions/cache
+      - name: Check stale stderr
+        run: ./ci/check_stale_stderr.sh
+
   check_actions:
     needs: generate_cache
     runs-on: ubuntu-latest
@@ -752,10 +798,8 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
-
       - name: Populate cache
         uses: ./.github/actions/cache
-
       - name: Check Actions
         run: ./ci/check_actions.sh
 
@@ -767,10 +811,8 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
-
       - name: Populate cache
         uses: ./.github/actions/cache
-      
       - name: Check README.md
         run: ./ci/check_readme.sh
 
@@ -782,10 +824,8 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
-
       - name: Populate cache
         uses: ./.github/actions/cache
-
       # Make sure that both crates are at the same version, and that zerocopy
       # depends exactly upon the current version of zerocopy-derive. See
       # `INTERNAL.md` for an explanation of why we do this.
@@ -798,12 +838,10 @@ jobs:
     name: Check MSRV is minimal
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-
         with:
           persist-credentials: false
       - name: Populate cache
         uses: ./.github/actions/cache
-
       - name: Check MSRV is minimal
         run: ./ci/check_msrv_is_minimal.sh
 
@@ -814,7 +852,6 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
-
       - name: Populate cache
         uses: ./.github/actions/cache
         with:
@@ -838,14 +875,6 @@ jobs:
             #
             # [1]  https://stackoverflow.com/a/42139535/836390
 
-            # See comment on "Pin syn dependency" job for why we do this. It needs
-            # to happen before the subsequent `cargo check`, so we don't
-            # background it.
-            #
-            # TODO(#1595): Debug why this step is still necessary after #1564 and
-            # maybe remove it.
-            cargo add -p zerocopy-derive 'syn@=2.0.46' &> /dev/null
-
             cargo check --workspace --tests                         &> /dev/null &
             # On our MSRV toolchain, updating the Cargo index takes a long time, so
             # it is worth specifically caching the MSRV index.
@@ -864,7 +893,9 @@ jobs:
     name: Check that all toolchains listed in Cargo.toml are tested in CI
     steps:
       - name: Install yq (for YAML parsing)
-        run: go install github.com/mikefarah/yq/v4@latest
+        # FIXME(https://github.com/mikefarah/yq/issues/2587): Remove
+        # `GONOSUMDB` once this bug is fixed.
+        run: GONOSUMDB=github.com/mikefarah/yq/v4 go install github.com/mikefarah/yq/v4@v4.44.1
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
@@ -876,7 +907,9 @@ jobs:
     name: Check all-jobs-succeeded depends on all jobs
     steps:
       - name: Install yq (for YAML parsing)
-        run: go install github.com/mikefarah/yq/v4@latest
+        # FIXME(https://github.com/mikefarah/yq/issues/2587): Remove
+        # `GONOSUMDB` once this bug is fixed.
+        run: GONOSUMDB=github.com/mikefarah/yq/v4 go install github.com/mikefarah/yq/v4@v4.44.1
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           persist-credentials: false
@@ -902,7 +935,9 @@ jobs:
     name: Run Git hooks
     steps:
       - name: Install yq (for YAML parsing)
-        run: go install github.com/mikefarah/yq/v4@latest
+        # FIXME(https://github.com/mikefarah/yq/issues/2587): Remove
+        # `GONOSUMDB` once this bug is fixed.
+        run: GONOSUMDB=github.com/mikefarah/yq/v4 go install github.com/mikefarah/yq/v4@v4.44.1
       - name: Install ripgrep
         run: |
          sudo apt-get update
@@ -934,6 +969,8 @@ jobs:
           persist-credentials: false
       - uses: zizmorcore/zizmor-action@e639db99335bc9038abc0e066dfcd72e23d26fb4 # v0.3.0
         with:
+          # Only scan the .github directory to avoid scanning vendored dependencies
+          inputs: .github
           # We don't want to use GitHub Advanced Security because we want to
           # block the merge on zizmor failure, and the only way to do that
           # (without manually configuring a ruleset) is to fail the job, which
@@ -951,7 +988,7 @@ jobs:
       # https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks
       if: failure()
       runs-on: ubuntu-latest
-      needs: [build_test, coverage, kani, check_be_aarch64, check_avr_atmega, check_fmt, check_actions, check_readme, check_versions, check_msrv_is_minimal, generate_cache, check-all-toolchains-tested, check-job-dependencies, check-todo, run-git-hooks, zizmor]
+      needs: [build_test, coverage, kani, check_be_aarch64, check_avr_atmega, check_fmt, check_actions, check_readme, check_versions, check_msrv_is_minimal, check_stale_stderr, generate_cache, check-all-toolchains-tested, check-job-dependencies, check-todo, run-git-hooks, zizmor]
       steps:
         - name: Mark the job as failed
           run: exit 1
