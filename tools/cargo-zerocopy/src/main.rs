@@ -20,9 +20,10 @@
 // Cargo.toml section.
 
 use std::{
+    collections::HashSet,
     env, fmt, fs,
-    io::{self, Read as _},
-    process::{self, Command, Output},
+    io::{self, BufRead as _, Write as _},
+    process::{self, Command, Output, Stdio},
 };
 
 use toml::{map::Map, Value};
@@ -126,48 +127,147 @@ fn get_toolchain_versions() -> Versions {
     }
 }
 
-fn is_toolchain_installed(versions: &Versions, name: &str) -> Result<bool, Error> {
-    let version = versions.get(name)?;
-    let output = rustup(["run", version, "cargo", "version"], None).output().unwrap();
-    if output.status.success() {
-        let output = rustup([&format!("+{version}"), "component", "list"], None).output_or_exit();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        Ok(stdout.contains("rust-src (installed)"))
-    } else {
-        Ok(false)
+fn ensure_installed_or_exit(
+    is_installed: impl FnOnce() -> Result<bool, Error>,
+    install: impl FnOnce() -> Result<(), Error>,
+    missing_item_desc: &str,
+    prompt: &str,
+) -> Result<(), Error> {
+    if is_installed()? {
+        return Ok(());
     }
-}
 
-fn install_toolchain_or_exit(versions: &Versions, name: &str) -> Result<(), Error> {
-    eprintln!("[cargo-zerocopy] missing either toolchain '{name}' or component 'rust-src'");
+    eprintln!("[cargo-zerocopy] {missing_item_desc}");
     if env::var("GITHUB_RUN_ID").is_ok() {
         eprintln!("[cargo-zerocopy] detected GitHub Actions environment; auto-installing without waiting for confirmation");
     } else if env::var("CARGO_ZEROCOPY_AUTO_INSTALL_TOOLCHAIN").is_ok() {
         eprintln!("[cargo-zerocopy] detected CARGO_ZEROCOPY_AUTO_INSTALL_TOOLCHAIN environment variable; auto-installing without waiting for confirmation");
     } else {
-        eprintln!("[cargo-zerocopy] set CARGO_ZEROCOPY_AUTO_INSTALL_TOOLCHAIN=1 to always install toolchains without prompting");
+        eprintln!("[cargo-zerocopy] set CARGO_ZEROCOPY_AUTO_INSTALL_TOOLCHAIN=1 to always install toolchains and targets without prompting");
         loop {
-            eprint!("[cargo-zerocopy] would you like to install toolchain '{name}' and component 'rust-src' via 'rustup' (y/n)? ");
-            let mut input = [0];
-            io::stdin().read_exact(&mut input).unwrap();
-            match input[0] as char {
-                'y' | 'Y' => break,
-                'n' | 'N' => process::exit(1),
-                _ => (),
+            eprint!("[cargo-zerocopy] {prompt} (y/n)? ");
+            io::stderr().flush().unwrap();
+            let mut line = String::new();
+            io::stdin().lock().read_line(&mut line).unwrap();
+            let input = line.trim().to_lowercase();
+            if input.starts_with('y') {
+                break;
+            } else if input.starts_with('n') {
+                process::exit(1);
             }
         }
     }
 
-    let version = versions.get(name)?;
-    rustup(["toolchain", "install", version, "-c", "rust-src"], None).execute();
+    install()?;
 
     Ok(())
+}
+
+fn install_toolchain_or_exit(versions: &Versions, name: &str) -> Result<(), Error> {
+    let version = versions.get(name)?.to_string();
+    let is_nightly = version.contains("nightly");
+
+    ensure_installed_or_exit(
+        || {
+            let output = rustup(["run", &version, "cargo", "version"], None).output();
+            let output = match output {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("[cargo-zerocopy] failed to run rustup: {e}");
+                    process::exit(1);
+                }
+            };
+            if output.status.success() {
+                let output =
+                    rustup([&format!("+{version}"), "component", "list"], None).output_or_exit();
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let is_installed =
+                    |c| stdout.lines().any(|l| l.starts_with(c) && l.contains("(installed)"));
+                let mut installed =
+                    is_installed("rust-src") && is_installed("rustfmt") && is_installed("clippy");
+                if is_nightly {
+                    installed = installed && is_installed("miri");
+                }
+                Ok(installed)
+            } else {
+                Ok(false)
+            }
+        },
+        || {
+            let mut args = vec![
+                "toolchain",
+                "install",
+                &version,
+                "-c",
+                "rust-src",
+                "-c",
+                "rustfmt",
+                "-c",
+                "clippy",
+            ];
+            if is_nightly {
+                args.push("-c");
+                args.push("miri");
+            }
+            rustup(args, None).stdout(Stdio::null()).execute();
+            Ok(())
+        },
+        &format!(
+            "missing toolchain '{name}' or one of its components (rust-src, rustfmt, clippy{})",
+            if is_nightly { ", miri" } else { "" }
+        ),
+        &format!("would you like to install toolchain '{name}' and its components via 'rustup'"),
+    )
+}
+
+fn install_targets_or_exit(version: &str, targets: &[String]) -> Result<(), Error> {
+    // Avoid running `rustup` in the common case that no `--target` arguments
+    // are provided.
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let output = rustup(["target", "list", "--toolchain", version], None).output_or_exit();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut installed = HashSet::new();
+    let mut available = HashSet::new();
+
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        if let Some(target) = parts.next() {
+            available.insert(target.to_string());
+            if parts.next() == Some("(installed)") {
+                installed.insert(target.to_string());
+            }
+        }
+    }
+
+    let to_install = targets
+        .iter()
+        .filter(|target| {
+            !installed.contains(target.as_str()) && available.contains(target.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let to_install_str = to_install.join(", ");
+    ensure_installed_or_exit(
+        || Ok(to_install.is_empty()),
+        || {
+            let mut args = vec!["target", "add", "--toolchain", version];
+            args.extend(to_install.iter().map(|s| s.as_str()));
+            rustup(args, None).stdout(Stdio::null()).execute();
+            Ok(())
+        },
+        &format!("missing target(s): {to_install_str}"),
+        &format!("would you like to install target(s) '{to_install_str}' via 'rustup'"),
+    )
 }
 
 fn get_rustflags(name: &str) -> String {
     // See #1792 for context on zerocopy_derive_union_into_bytes.
     let mut flags =
-        "--cfg zerocopy_derive_union_into_bytes --cfg __ZEROCOPY_INTERNAL_USE_ONLY_DEV_MODE"
+        "--cfg zerocopy_unstable_derive_on_error --cfg zerocopy_derive_union_into_bytes --cfg __ZEROCOPY_INTERNAL_USE_ONLY_DEV_MODE"
             .to_string();
     flags += &format!(" --cfg __ZEROCOPY_INTERNAL_USE_ONLY_TOOLCHAIN=\"{name}\"");
 
@@ -223,9 +323,39 @@ fn delegate_cargo() -> Result<(), Error> {
             if let Some(name) = arg.strip_prefix('+') {
                 let version = versions.get(name)?;
 
-                if !is_toolchain_installed(&versions, name)? {
-                    install_toolchain_or_exit(&versions, name)?;
+                install_toolchain_or_exit(&versions, name)?;
+
+                let mut targets = Vec::new();
+                if let Ok(t) = env::var("CARGO_BUILD_TARGET") {
+                    targets.push(t);
                 }
+
+                let args_vec = args.collect::<Vec<_>>();
+                let mut i = 0;
+                while i < args_vec.len() {
+                    let arg = &args_vec[i];
+                    if arg == "--" {
+                        break;
+                    }
+
+                    if arg == "--target" {
+                        if i + 1 < args_vec.len() {
+                            targets.push(args_vec[i + 1].clone());
+                            i += 1;
+                        }
+                    } else if let Some(t) = arg.strip_prefix("--target=") {
+                        targets.push(t.to_string());
+                    }
+                    i += 1;
+                }
+
+                targets.retain(|t| !t.ends_with(".json"));
+                targets.sort();
+                targets.dedup();
+
+                install_targets_or_exit(version, &targets)?;
+
+                let mut args = args_vec.into_iter();
 
                 let env_rustflags = env::vars()
                     .filter_map(|(k, v)| if k == "RUSTFLAGS" { Some(v) } else { None })
@@ -239,7 +369,10 @@ fn delegate_cargo() -> Result<(), Error> {
                     env_rustflags,
                 );
 
+                // Pass RUSTFLAGS to both Rust (via `RUSTFLAGS`) and Rustdoc
+                // (via `RUSTDOCFLAGS`).
                 let mut cmd = rustup(["run", version, "cargo"], Some(("RUSTFLAGS", &rustflags)));
+                cmd.env("RUSTDOCFLAGS", &rustflags);
 
                 if env::var("CARGO_TARGET_DIR").is_ok() {
                     eprintln!("[cargo-zerocopy] WARNING: `CARGO_TARGET_DIR` is set - this may cause `cargo-zerocopy` to behave unexpectedly");
@@ -257,7 +390,7 @@ fn delegate_cargo() -> Result<(), Error> {
                     let output = rustup(["run", version, "cargo", "pkgid", "-p"], None)
                         .arg(p)
                         .output_or_exit();
-                    String::from_utf8(output.stdout).unwrap()
+                    String::from_utf8(output.stdout).unwrap().trim().to_string()
                 };
 
                 // Replace `-p<package>`, `-p <package>` and `--package <package`
@@ -270,7 +403,7 @@ fn delegate_cargo() -> Result<(), Error> {
                         break;
                     };
                     if arg == "-p" || arg == "--package" {
-                        cmd.arg(arg);
+                        cmd.arg(&arg);
                         let Some(arg) = args.next() else {
                             break;
                         };
@@ -278,8 +411,23 @@ fn delegate_cargo() -> Result<(), Error> {
                     } else if arg.starts_with("-p") {
                         cmd.arg("-p");
                         cmd.arg(fqpn(arg[2..].to_string()));
+                    } else if arg == "--" {
+                        cmd.arg("--");
+                        cmd.args(args);
+                        break;
                     } else {
-                        cmd.arg(arg);
+                        if arg == "--target" {
+                            cmd.arg(&arg);
+                            if let Some(target) = args.next() {
+                                cmd.arg(&target);
+                                cmd.env("ZEROCOPY_UI_TEST_TARGET", target);
+                            }
+                        } else if let Some(target) = arg.strip_prefix("--target=") {
+                            cmd.arg(&arg);
+                            cmd.env("ZEROCOPY_UI_TEST_TARGET", target);
+                        } else {
+                            cmd.arg(arg);
+                        }
                     }
                 }
 

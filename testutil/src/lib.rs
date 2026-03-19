@@ -6,59 +6,10 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-// Inlining format args isn't supported on our MSRV.
-#![allow(clippy::uninlined_format_args)]
+#![allow(unknown_lints)]
+#![deny(unexpected_cfgs)]
 
-use std::{env, error::Error, fs};
-
-use rustc_version::{Channel, Version};
-
-struct PinnedVersions {
-    msrv: String,
-    stable: String,
-    nightly: String,
-}
-
-impl PinnedVersions {
-    /// Attempts to extract pinned toolchain versions based on the current
-    /// working directory.
-    ///
-    /// `extract_from_pwd` expects to be called from a directory which is a
-    /// child of a Cargo workspace. It extracts the pinned versions from the
-    /// metadata of the root package.
-    fn extract_from_pwd() -> Result<PinnedVersions, Box<dyn Error>> {
-        let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
-            .ok_or("CARGO_MANIFEST_DIR environment variable not set")?
-            .into_string()
-            .map_err(|_| "could not parse $CARGO_MANIFEST_DIR as UTF-8")?;
-        let manifest_path = if manifest_dir.ends_with("zerocopy-derive") {
-            manifest_dir + "/../Cargo.toml"
-        } else {
-            manifest_dir + "/Cargo.toml"
-        };
-        let manifest = fs::read_to_string(manifest_path)?;
-        let manifest: toml::map::Map<String, toml::Value> = toml::from_str(&manifest)?;
-        let manifest = toml::Value::Table(manifest);
-
-        let extract = |keys: &[&str]| -> Result<String, String> {
-            let mut val = &manifest;
-            for k in keys {
-                val = val
-                    .get(k)
-                    .ok_or(format!("failed to look up path in Cargo.toml: {:?}", keys))?;
-            }
-
-            val.as_str()
-                .map(|s| s.to_string())
-                .ok_or(format!("expected string value for path in Cargo.toml: {:?}", keys))
-        };
-
-        let msrv = extract(&["package", "rust-version"])?;
-        let stable = extract(&["package", "metadata", "ci", "pinned-stable"])?;
-        let nightly = extract(&["package", "metadata", "ci", "pinned-nightly"])?;
-        Ok(PinnedVersions { msrv, stable, nightly })
-    }
-}
+use std::{env, path::PathBuf, process::Command};
 
 #[derive(Debug)]
 pub enum ToolchainVersion {
@@ -69,101 +20,28 @@ pub enum ToolchainVersion {
     PinnedStable,
     /// The nightly version pinned in CI
     PinnedNightly,
-    /// A stable version other than the one pinned in CI.
-    OtherStable,
-    /// A nightly version other than the one pinned in CI.
-    OtherNightly,
 }
 
 impl ToolchainVersion {
     /// Attempts to determine whether the current toolchain version matches one
     /// of the versions pinned in CI and if so, which one.
-    pub fn extract_from_pwd() -> Result<ToolchainVersion, Box<dyn Error>> {
-        let pinned_versions = PinnedVersions::extract_from_pwd()?;
-        let current = rustc_version::version_meta()?;
-
-        let s = match current.channel {
-            Channel::Dev | Channel::Beta => {
-                return Err(format!("unsupported channel: {:?}", current.channel).into())
-            }
-            Channel::Nightly => {
-                format!(
-                    "nightly-{}",
-                    current.commit_date.as_ref().ok_or("nightly channel missing commit date")?
-                )
-            }
-            Channel::Stable => {
-                let Version { major, minor, patch, .. } = current.semver;
-                format!("{}.{}.{}", major, minor, patch)
-            }
-        };
-
-        // Due to a quirk of how Rust nightly versions are encoded and published
-        // [1], the version as understood by rustup uses a date one day ahead of
-        // the version as encoded in the `rustc` binary itself.
-        // `pinned_versions` encodes the former notion of the date (as it is
-        // meant to be passed as the `+<toolchain>` selector syntax understood
-        // by rustup), while `current` encodes the latter notion of the date (as
-        // it is extracted from `rustc`). Without this adjustment, toolchain
-        // versions that should be considered equal would not be.
-        //
-        // [1] https://github.com/rust-lang/rust/issues/51533
-        let pinned_nightly_adjusted = {
-            let desc = time::macros::format_description!("nightly-[year]-[month]-[day]");
-            let date = time::Date::parse(&pinned_versions.nightly, &desc).map_err(|_| {
-                format!("failed to parse nightly version: {}", pinned_versions.nightly)
-            })?;
-            let adjusted = date - time::Duration::DAY;
-            adjusted.format(&desc).unwrap()
-        };
-
-        Ok(match s {
-            s if s == pinned_versions.msrv => ToolchainVersion::PinnedMsrv,
-            s if s == pinned_versions.stable => ToolchainVersion::PinnedStable,
-            s if s == pinned_nightly_adjusted => ToolchainVersion::PinnedNightly,
-            _ if current.channel == Channel::Stable => ToolchainVersion::OtherStable,
-            _ if current.channel == Channel::Nightly => ToolchainVersion::OtherNightly,
-            _ => {
-                return Err(format!(
-                    "current toolchain ({:?}) doesn't match any known version",
-                    current
-                )
-                .into())
-            }
-        })
+    pub fn extract_from_env() -> Option<ToolchainVersion> {
+        if cfg!(__ZEROCOPY_INTERNAL_USE_ONLY_TOOLCHAIN = "msrv") {
+            Some(ToolchainVersion::PinnedMsrv)
+        } else if cfg!(__ZEROCOPY_INTERNAL_USE_ONLY_TOOLCHAIN = "stable") {
+            Some(ToolchainVersion::PinnedStable)
+        } else if cfg!(__ZEROCOPY_INTERNAL_USE_ONLY_TOOLCHAIN = "nightly") {
+            Some(ToolchainVersion::PinnedNightly)
+        } else {
+            None
+        }
     }
 
-    /// Gets the name of the directory in which to store source files and
-    /// expected output for UI tests for this toolchain version.
-    ///
-    /// For toolchain versions which are not pinned in CI, prints a warning to
-    /// `stderr` which will be captured by the test harness and only printed on
-    /// test failure.
-    ///
-    /// UI tests depend on the exact error messages emitted by rustc, but those
-    /// error messages are not stable, and sometimes change between Rust
-    /// versions. Thus, we maintain one set of UI tests for each Rust version
-    /// that we test in CI, and we pin to specific versions in CI (a specific
-    /// MSRV, a specific stable version, and a specific date of the nightly
-    /// compiler). Updating those pinned versions may also require updating
-    /// these tests.
-    /// - `tests/ui-nightly` - Contains the source of truth for our UI test
-    ///   source files (`.rs`), and contains `.err` and `.out` files for nightly
-    /// - `tests/ui-stable` - Contains symlinks to the `.rs` files in
-    ///   `tests/ui-nightly`, and contains `.err` and `.out` files for stable
-    /// - `tests/ui-msrv` - Contains symlinks to the `.rs` files in
-    ///   `tests/ui-nightly`, and contains `.err` and `.out` files for MSRV
-    pub fn get_ui_source_files_dirname_and_maybe_print_warning(&self) -> &'static str {
-        if matches!(self, ToolchainVersion::OtherStable | ToolchainVersion::OtherNightly) {
-            // This will be eaten by the test harness and only displayed on
-            // failure.
-            eprintln!("warning: current toolchain does not match any toolchain pinned in CI; this may cause spurious test failure");
-        }
-
+    pub fn name(&self) -> &'static str {
         match self {
-            ToolchainVersion::PinnedMsrv => "ui-msrv",
-            ToolchainVersion::PinnedStable | ToolchainVersion::OtherStable => "ui-stable",
-            ToolchainVersion::PinnedNightly | ToolchainVersion::OtherNightly => "ui-nightly",
+            ToolchainVersion::PinnedMsrv => "msrv",
+            ToolchainVersion::PinnedStable => "stable",
+            ToolchainVersion::PinnedNightly => "nightly",
         }
     }
 }
@@ -180,9 +58,255 @@ pub fn set_rustflags_w_warnings() {
     // [1] https://github.com/rust-lang/rust/issues/27970
     let guard = ENV_MTX.lock();
 
-    let mut rustflags = env::var_os("RUSTFLAGS").unwrap_or_default();
+    let mut rustflags = std::env::var_os("RUSTFLAGS").unwrap_or_default();
     rustflags.push(" -Wwarnings");
-    env::set_var("RUSTFLAGS", rustflags);
+    std::env::set_var("RUSTFLAGS", rustflags);
 
     std::mem::drop(guard);
+}
+
+pub struct UiTestRunner {
+    toolchain: ToolchainVersion,
+    rustc_args: Vec<String>,
+    tests_dir: String,
+    tests_subdir: Option<String>,
+}
+
+impl Default for UiTestRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UiTestRunner {
+    pub fn new() -> Self {
+        let toolchain = ToolchainVersion::extract_from_env()
+            .expect("UI tests must only be run on pinned MSRV, stable, or nightly toolchains");
+
+        Self {
+            toolchain,
+            rustc_args: Vec::new(),
+            tests_dir: "tests".to_string(), // Default prefix
+            tests_subdir: None,
+        }
+    }
+
+    pub fn rustc_arg(mut self, arg: impl Into<String>) -> Self {
+        self.rustc_args.push(arg.into());
+        self
+    }
+
+    pub fn dir(mut self, dir: impl Into<String>) -> Self {
+        self.tests_dir = dir.into();
+        self
+    }
+
+    pub fn subdir(mut self, subdir: impl Into<String>) -> Self {
+        self.tests_subdir = Some(subdir.into());
+        self
+    }
+
+    pub fn run(self) {
+        // Find the root workspace
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+        let mut workspace_root = PathBuf::from(manifest_dir);
+        loop {
+            if workspace_root.join("cargo.sh").exists() {
+                break;
+            }
+            if !workspace_root.pop() {
+                panic!("Could not find workspace root");
+            }
+        }
+
+        let mut rlib_path = None;
+        let mut derive_lib_path = None;
+        let mut static_assertions_path = None;
+
+        let mut command = Command::new("cargo");
+        command.current_dir(workspace_root.clone());
+        // We strip `--cfg zerocopy_derive_union_into_bytes` and `--cfg
+        // zerocopy_unstable_derive_on_error` from `RUSTFLAGS` so that the
+        // `zerocopy-derive` proc macro is built without them. This ensures it
+        // generates the feature-gate checks into the UI tests, which we can
+        // then explicitly enable or disable via `rustc_args`.
+        let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
+        let cfgs_to_strip =
+            ["--cfg zerocopy_derive_union_into_bytes", "--cfg zerocopy_unstable_derive_on_error"];
+        for &cfg in &cfgs_to_strip {
+            rustflags = rustflags.replace(cfg, "");
+        }
+        if let Ok(flags) = env::var("RUSTDOCFLAGS") {
+            let mut new_flags = flags;
+            for &cfg in &cfgs_to_strip {
+                new_flags = new_flags.replace(cfg, "");
+            }
+            command.env("RUSTDOCFLAGS", new_flags);
+        }
+        command.env("RUSTFLAGS", rustflags);
+        command.env_remove("CARGO_ENCODED_RUSTFLAGS");
+        command.env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
+
+        let mut args = vec![
+            "build",
+            "-p",
+            "zerocopy",
+            "--features",
+            "derive",
+            "--tests",
+            "--message-format=json",
+        ];
+
+        // `cargo-zerocopy` uses `ZEROCOPY_UI_TEST_TARGET` to pass the value of
+        // any `--target` CLI argument. Here, we use this target when building
+        // `zerocopy` itself.
+        let target = env::var("ZEROCOPY_UI_TEST_TARGET").ok();
+
+        if let Some(ref t) = target {
+            args.push("--target");
+            args.push(t);
+        }
+
+        command.args(args);
+
+        let output = command.output().expect("Failed to execute cargo build for artifacts");
+        if !output.status.success() {
+            println!("{}", String::from_utf8_lossy(&output.stderr));
+            panic!("Failed to build zerocopy artifacts for ui tests");
+        }
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        // DEBUG: print stdout and stderr to see if it rebuilt
+        // println!("CARGO BUILD STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+        // println!("CARGO BUILD STDOUT:\n{}", stdout);
+        for msg in cargo_metadata::Message::parse_stream(stdout.as_bytes()) {
+            if let Ok(cargo_metadata::Message::CompilerArtifact(artifact)) = msg {
+                if artifact.profile.test {
+                    // There can be multiple `libzerocopy` artifacts from other
+                    // builds. Skip any that are built with `--test` - these
+                    // aren't what we're looking for. If we include them, it
+                    // will result in "duplicate crate" errors.
+                    continue;
+                }
+
+                if artifact.target.name == "zerocopy"
+                    && artifact.target.kind.iter().any(|k| k == "lib")
+                {
+                    for file in artifact.filenames {
+                        if file.extension() == Some("rlib") {
+                            rlib_path = Some(file);
+                        }
+                    }
+                } else if artifact.target.name == "zerocopy-derive"
+                    || artifact.target.name == "zerocopy_derive"
+                {
+                    for file in artifact.filenames {
+                        if file.extension() == Some("so")
+                            || file.extension() == Some("dylib")
+                            || file.extension() == Some("dll")
+                        {
+                            derive_lib_path = Some(file);
+                        }
+                    }
+                } else if artifact.target.name == "static_assertions" {
+                    for file in artifact.filenames {
+                        if file.extension() == Some("rlib") {
+                            static_assertions_path = Some(file);
+                        }
+                    }
+                }
+            }
+        }
+
+        let rlib_path = rlib_path.expect("failed to find zerocopy.rlib");
+        let derive_lib_path = derive_lib_path.expect("failed to find zerocopy_derive proc-macro");
+        let static_assertions_path =
+            static_assertions_path.expect("failed to find static_assertions rlib");
+
+        let mut build_command = Command::new("rustup");
+
+        // Prevent `RUSTFLAGS` (e.g. `-Zrandomize-layout` from Nightly CI) from
+        // bleeding into our stable `ui-runner` build and crashing it.
+        build_command.env_remove("CARGO_ENCODED_RUSTFLAGS");
+        build_command.env_remove("RUSTFLAGS");
+        build_command.env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
+        build_command.env_remove("RUSTDOCFLAGS");
+
+        build_command.current_dir(workspace_root.clone());
+        build_command.args([
+            "run",
+            "stable",
+            "cargo",
+            "build",
+            "--manifest-path=tools/ui-runner/Cargo.toml",
+            "--config=tools/.cargo/config.toml",
+            "--message-format=json",
+        ]);
+
+        // Isolate build to avoid invalidating the libzerocopy cargo cache
+        build_command.env("CARGO_TARGET_DIR", workspace_root.join("target/ui-runner"));
+
+        let output = build_command.output().unwrap();
+        if !output.status.success() {
+            println!("{}", String::from_utf8_lossy(&output.stderr));
+            panic!("Failed to build ui-runner");
+        }
+
+        let mut ui_runner_path = None;
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        for msg in cargo_metadata::Message::parse_stream(stdout.as_bytes()) {
+            if let Ok(cargo_metadata::Message::CompilerArtifact(artifact)) = msg {
+                if artifact.target.name == "ui-runner" {
+                    if let Some(path) = artifact.executable {
+                        ui_runner_path = Some(path);
+                    }
+                }
+            }
+        }
+
+        let ui_runner_path = ui_runner_path.expect("failed to find ui-runner binary");
+
+        let mut command = Command::new(ui_runner_path);
+
+        for arg in &self.rustc_args {
+            command.arg(format!("--rustc-arg={}", arg));
+        }
+
+        command.env("ZEROCOPY_RLIB_PATH", rlib_path);
+        command.env("ZEROCOPY_DERIVE_LIB_PATH", derive_lib_path);
+        command.env("ZEROCOPY_STATIC_ASSERTIONS_PATH", static_assertions_path);
+        command.env("ZEROCOPY_WORKSPACE_ROOT", workspace_root.display().to_string());
+
+        if let Some(ref t) = target {
+            command.arg(format!("--rustc-arg=--target={}", t));
+        }
+
+        let mut test_src_dir = format!("{}/ui", &self.tests_dir);
+        if let Some(subdir) = self.tests_subdir.as_ref() {
+            test_src_dir = format!("{}/{}", test_src_dir, subdir);
+        }
+        command.env("ZEROCOPY_UI_TEST_DIR", test_src_dir);
+
+        command.env("ZEROCOPY_UI_TEST_TOOLCHAIN_META_NAME", self.toolchain.name());
+
+        let toolchain_name =
+            env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| self.toolchain.name().to_string());
+        command.env("ZEROCOPY_UI_TEST_TOOLCHAIN", &toolchain_name);
+
+        // Clear variables that might confuse the sub-invocation or rustc
+        for (key, _) in env::vars() {
+            if key.starts_with("CARGO_")
+                || key.starts_with("RUST_")
+                || key.starts_with("RUSTFLAGS")
+                || key.starts_with("RUSTDOCFLAGS")
+            {
+                command.env_remove(&key);
+            }
+        }
+
+        command.env("RUSTUP_TOOLCHAIN", toolchain_name);
+
+        let mut proc = command.spawn().expect("Failed to spawn ui-runner");
+        assert!(proc.wait().unwrap().success(), "ui-runner failed");
+    }
 }
